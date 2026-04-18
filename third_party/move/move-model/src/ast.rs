@@ -86,6 +86,10 @@ pub struct FrameSpec {
     pub modifies_targets: Vec<Exp>,
     /// Resource types that are read (resolved struct IDs).
     pub reads_targets: BTreeSet<QualifiedInstId<StructId>>,
+    /// Wildcard: `modifies_of<f> *` — function can modify any memory.
+    pub modifies_all: bool,
+    /// Wildcard: `reads_of<f> *` — function can read any memory.
+    pub reads_all: bool,
 }
 
 /// Combined reads/writes access for a function-typed parameter.
@@ -1134,7 +1138,10 @@ impl ExpData {
         use ExpData::*;
         matches!(
             self,
-            LocalVar(..) | Temporary(..) | Call(_, Operation::Select(..), _)
+            LocalVar(..)
+                | Temporary(..)
+                | Call(_, Operation::Select(..), _)
+                | Call(_, Operation::SelectVariants(..), _)
         )
     }
 
@@ -1262,6 +1269,36 @@ impl ExpData {
             (SpecBlock(_, spec1), SpecBlock(_, spec2)) => spec1.structural_eq(spec2),
             _ => false,
         }
+    }
+
+    /// Returns true if this expression is state-neutral: its value does not depend on
+    /// global state and is the same regardless of which program state it's evaluated in.
+    /// Such expressions can safely be extracted into spec-level `let` bindings.
+    pub fn is_state_neutral(&self) -> bool {
+        let mut neutral = true;
+        self.visit_pre_order(&mut |e: &ExpData| match e {
+            ExpData::Call(_, Operation::Global(_), _)
+            | ExpData::Call(_, Operation::Exists(_), _)
+            | ExpData::Call(_, Operation::Old, _)
+            | ExpData::Call(_, Operation::Result(..), _) => {
+                neutral = false;
+                false
+            },
+            ExpData::Call(
+                _,
+                Operation::Behavior(_, range)
+                | Operation::SpecFunction(_, _, range)
+                | Operation::SpecPublish(range)
+                | Operation::SpecRemove(range)
+                | Operation::SpecUpdate(range),
+                _,
+            ) if range.pre.is_some() || range.post.is_some() => {
+                neutral = false;
+                false
+            },
+            _ => neutral,
+        });
+        neutral
     }
 
     pub fn node_id(&self) -> NodeId {
@@ -2693,6 +2730,9 @@ pub enum Pattern {
     ),
     /// A literal value pattern (for matching literal constants)
     LiteralValue(NodeId, Value),
+    /// A range pattern: Range(id, lo, hi, inclusive_upper)
+    /// lo..hi, lo..=hi, lo.., ..hi, ..=hi, ..
+    Range(NodeId, Option<Value>, Option<Value>, bool),
     Error(NodeId),
 }
 
@@ -2705,6 +2745,7 @@ impl Pattern {
             | Pattern::Tuple(id, _)
             | Pattern::Struct(id, _, _, _)
             | Pattern::LiteralValue(id, _)
+            | Pattern::Range(id, _, _, _)
             | Pattern::Error(id) => *id,
         }
     }
@@ -2731,6 +2772,9 @@ impl Pattern {
                         .all(|(p1, p2)| p1.structural_eq(p2))
             },
             (Pattern::LiteralValue(_, v1), Pattern::LiteralValue(_, v2)) => v1 == v2,
+            (Pattern::Range(_, lo1, hi1, inc1), Pattern::Range(_, lo2, hi2, inc2)) => {
+                lo1 == lo2 && hi1 == hi2 && inc1 == inc2
+            },
             (Pattern::Error(_), Pattern::Error(_)) => true,
             _ => false,
         }
@@ -2766,7 +2810,7 @@ impl Pattern {
     pub fn has_no_struct(&self) -> bool {
         use Pattern::*;
         match self {
-            Var(..) | Wildcard(..) | LiteralValue(..) | Error(..) => true,
+            Var(..) | Wildcard(..) | LiteralValue(..) | Range(..) | Error(..) => true,
             Tuple(_, pats) => pats.iter().all(|p| p.has_no_struct()),
             Struct(..) => false,
         }
@@ -2993,7 +3037,10 @@ impl Pattern {
                     .map(|pat| pat.remove_vars(vars))
                     .collect(),
             ),
-            Pattern::Error(..) | Pattern::Wildcard(..) | Pattern::LiteralValue(..) => self,
+            Pattern::Error(..)
+            | Pattern::Wildcard(..)
+            | Pattern::LiteralValue(..)
+            | Pattern::Range(..) => self,
         }
     }
 
@@ -3040,7 +3087,10 @@ impl Pattern {
                     None
                 }
             },
-            Pattern::Error(..) | Pattern::Wildcard(..) | Pattern::LiteralValue(..) => None,
+            Pattern::Error(..)
+            | Pattern::Wildcard(..)
+            | Pattern::LiteralValue(..)
+            | Pattern::Range(..) => None,
         }
     }
 
@@ -3054,7 +3104,7 @@ impl Pattern {
         use Pattern::*;
         visitor(false, self);
         match self {
-            Var(..) | Wildcard(..) | LiteralValue(..) | Error(..) => {},
+            Var(..) | Wildcard(..) | LiteralValue(..) | Range(..) | Error(..) => {},
             Tuple(_, patvec) => {
                 for pat in patvec {
                     pat.visit_pre_post(visitor);
@@ -3207,6 +3257,19 @@ impl PatDisplay<'_> {
             LiteralValue(_, val) => {
                 write!(f, "{}", self.env.display(val))?;
             },
+            Range(_, lo, hi, inclusive) => {
+                if let Some(l) = lo {
+                    write!(f, "{}", self.env.display(l))?;
+                }
+                if *inclusive {
+                    write!(f, "..=")?;
+                } else {
+                    write!(f, "..")?;
+                }
+                if let Some(h) = hi {
+                    write!(f, "{}", self.env.display(h))?;
+                }
+            },
             Error(_) => write!(f, "Pattern::Error")?,
         }
         if self.show_type && !showed_type {
@@ -3261,6 +3324,15 @@ pub enum Value {
 }
 
 impl Value {
+    /// If this is a `Number`, return the contained `BigInt`; otherwise `None`.
+    pub fn to_bigint(&self) -> Option<BigInt> {
+        if let Value::Number(n) = self {
+            Some(n.clone())
+        } else {
+            None
+        }
+    }
+
     /// Implement an equality relation on values which identifies representations which
     /// implement the same runtime value, assuming that types match.
     ///

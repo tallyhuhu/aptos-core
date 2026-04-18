@@ -93,6 +93,8 @@ pub(crate) struct ModuleBuilder<'env, 'translator> {
     pub fun_access_specifiers: BTreeMap<Symbol, Vec<AccessSpecifier>>,
     /// Access specifiers for function-typed parameters (from `modifies_of`/`reads_of`)
     pub fun_param_access_of: BTreeMap<Symbol, Vec<FunParamAccessOf>>,
+    /// Access specifiers for function-typed struct fields (from `modifies_of`/`reads_of` in struct spec)
+    pub struct_field_access_of: BTreeMap<Symbol, Vec<FunParamAccessOf>>,
     /// Translated struct specifications.
     pub struct_specs: BTreeMap<Symbol, Spec>,
     /// Translated module spec
@@ -182,6 +184,7 @@ impl<'env, 'translator> ModuleBuilder<'env, 'translator> {
             fun_defs: BTreeMap::new(),
             fun_access_specifiers: BTreeMap::new(),
             fun_param_access_of: BTreeMap::new(),
+            struct_field_access_of: BTreeMap::new(),
             struct_specs: BTreeMap::new(),
             module_spec: Spec::default(),
             spec_block_infos: Default::default(),
@@ -636,7 +639,7 @@ impl ModuleBuilder<'_, '_> {
         let params = et.analyze_and_add_params(&def.signature.parameters, true);
         let result_type = et.translate_type(&def.signature.return_type);
         let kind = if def.entry.is_some() {
-            if et.env().language_version.is_at_least(LanguageVersion::V2_0) && def.inline {
+            if def.inline {
                 et.error(&et.to_loc(&def.loc), "An entry function cannot be inlined.");
             }
             FunctionKind::Entry
@@ -1865,8 +1868,13 @@ impl ModuleBuilder<'_, '_> {
                 fun_param,
                 params,
                 targets,
-            } => self.def_ana_modifies_of(loc, context, fun_param, params, targets),
-            ReadsOf { fun_param, types } => self.def_ana_reads_of(loc, context, fun_param, types),
+                all,
+            } => self.def_ana_modifies_of(loc, context, fun_param, params, targets, *all),
+            ReadsOf {
+                fun_param,
+                types,
+                all,
+            } => self.def_ana_reads_of(loc, context, fun_param, types, *all),
             Modifies { targets } => self.def_ana_modifies(loc, context, targets),
             Reads { types } => self.def_ana_reads(loc, context, types),
             Let {
@@ -2746,14 +2754,11 @@ impl<'env, 'translator> ModuleBuilder<'env, 'translator> {
                 et.define_type_params(loc, &entry.type_params, false);
                 if let StructLayout::Singleton(fields, _is_positional) = &entry.layout {
                     et.enter_scope();
-                    let lang_ver_ge_2 =
-                        et.env().language_version.is_at_least(LanguageVersion::V2_0);
                     for f in fields.values() {
-                        // In Aptos Move 2.0 and above, field `self` is omitted from local bindings
-                        // so `self` can be used to refer to `self` parameter.
-                        if lang_ver_ge_2
-                            && f.name.display(et.symbol_pool()).to_string()
-                                == well_known::RECEIVER_PARAM_NAME
+                        // Field `self` is omitted from local bindings
+                        // so `self` can be used to refer to the `self` parameter.
+                        if f.name.display(et.symbol_pool()).to_string()
+                            == well_known::RECEIVER_PARAM_NAME
                         {
                             continue;
                         }
@@ -2769,20 +2774,16 @@ impl<'env, 'translator> ModuleBuilder<'env, 'translator> {
                             None,
                         );
                     }
-                    if lang_ver_ge_2 {
-                        let receiver_param_name =
-                            et.symbol_pool().make(well_known::RECEIVER_PARAM_NAME);
-                        let struct_type = Type::Struct(entry.module_id, entry.struct_id, vec![]);
-                        et.define_local(loc, receiver_param_name, struct_type, None, None);
-                    }
+                    let receiver_param_name =
+                        et.symbol_pool().make(well_known::RECEIVER_PARAM_NAME);
+                    let struct_type = Type::Struct(entry.module_id, entry.struct_id, vec![]);
+                    et.define_local(loc, receiver_param_name, struct_type, None, None);
                 } else if let StructLayout::Variants(_) = &entry.layout {
                     et.enter_scope();
-                    if et.env().language_version.is_at_least(LanguageVersion::V2_0) {
-                        let receiver_param_name =
-                            et.symbol_pool().make(well_known::RECEIVER_PARAM_NAME);
-                        let struct_type = Type::Struct(entry.module_id, entry.struct_id, vec![]);
-                        et.define_local(loc, receiver_param_name, struct_type, None, None);
-                    }
+                    let receiver_param_name =
+                        et.symbol_pool().make(well_known::RECEIVER_PARAM_NAME);
+                    let struct_type = Type::Struct(entry.module_id, entry.struct_id, vec![]);
+                    et.define_local(loc, receiver_param_name, struct_type, None, None);
                 }
 
                 et
@@ -3432,20 +3433,26 @@ impl ModuleBuilder<'_, '_> {
         fun_param: &Spanned<move_symbol_pool::Symbol>,
         params: &[(PA::Var, EA::Type)],
         targets: &[EA::Exp],
+        all: bool,
     ) {
-        let fun_name = match context {
-            SpecBlockContext::Function(name) => name.clone(),
+        let (owner_name, is_struct) = match context {
+            SpecBlockContext::Function(name) => (name.clone(), false),
+            SpecBlockContext::Struct(name) => (name.clone(), true),
             _ => {
                 self.parent.env.error(
                     loc,
-                    "`modifies_of` can only appear in a function spec block",
+                    "`modifies_of` can only appear in a function or struct spec block",
                 );
                 return;
             },
         };
-        // Validate that fun_param names an actual function-typed parameter.
+        // Validate that fun_param names a function-typed parameter or field.
         let param_sym = self.symbol_pool().make(&fun_param.value);
-        if let Some(entry) = self.parent.fun_table.get(&fun_name) {
+        if is_struct {
+            if !self.validate_struct_fun_field(loc, &owner_name, param_sym) {
+                return;
+            }
+        } else if let Some(entry) = self.parent.fun_table.get(&owner_name) {
             let found = entry
                 .params
                 .iter()
@@ -3456,7 +3463,7 @@ impl ModuleBuilder<'_, '_> {
                     &format!(
                         "`{}` is not a function-typed parameter of `{}`",
                         fun_param.value,
-                        fun_name.display(self.parent.env)
+                        owner_name.display(self.parent.env)
                     ),
                 );
                 return;
@@ -3480,11 +3487,20 @@ impl ModuleBuilder<'_, '_> {
             .map(|target| et.translate_modify_target(target).into_exp())
             .collect();
         et.finalize_types(true);
-        // Find or create entry for this parameter
-        let entries = self.fun_param_access_of.entry(fun_name.symbol).or_default();
+        // Find or create entry for this parameter/field
+        let entries = if is_struct {
+            self.struct_field_access_of
+                .entry(owner_name.symbol)
+                .or_default()
+        } else {
+            self.fun_param_access_of
+                .entry(owner_name.symbol)
+                .or_default()
+        };
         if let Some(entry) = entries.iter_mut().find(|e| e.fun_param == param_sym) {
             entry.modifies_params = translated_params;
             entry.frame_spec.modifies_targets = translated_targets;
+            entry.frame_spec.modifies_all = all;
         } else {
             entries.push(FunParamAccessOf {
                 loc: loc.clone(),
@@ -3493,6 +3509,8 @@ impl ModuleBuilder<'_, '_> {
                 frame_spec: FrameSpec {
                     modifies_targets: translated_targets,
                     reads_targets: BTreeSet::new(),
+                    modifies_all: all,
+                    ..Default::default()
                 },
                 used_memory: BTreeSet::new(),
                 old_memory: BTreeSet::new(),
@@ -3506,19 +3524,26 @@ impl ModuleBuilder<'_, '_> {
         context: &SpecBlockContext,
         fun_param: &Spanned<move_symbol_pool::Symbol>,
         types: &[EA::Type],
+        all: bool,
     ) {
-        let fun_name = match context {
-            SpecBlockContext::Function(name) => name.clone(),
+        let (owner_name, is_struct) = match context {
+            SpecBlockContext::Function(name) => (name.clone(), false),
+            SpecBlockContext::Struct(name) => (name.clone(), true),
             _ => {
-                self.parent
-                    .env
-                    .error(loc, "`reads_of` can only appear in a function spec block");
+                self.parent.env.error(
+                    loc,
+                    "`reads_of` can only appear in a function or struct spec block",
+                );
                 return;
             },
         };
-        // Validate that fun_param names an actual function-typed parameter.
+        // Validate that fun_param names a function-typed parameter or field.
         let param_sym = self.symbol_pool().make(&fun_param.value);
-        if let Some(entry) = self.parent.fun_table.get(&fun_name) {
+        if is_struct {
+            if !self.validate_struct_fun_field(loc, &owner_name, param_sym) {
+                return;
+            }
+        } else if let Some(entry) = self.parent.fun_table.get(&owner_name) {
             let found = entry
                 .params
                 .iter()
@@ -3529,7 +3554,7 @@ impl ModuleBuilder<'_, '_> {
                     &format!(
                         "`{}` is not a function-typed parameter of `{}`",
                         fun_param.value,
-                        fun_name.display(self.parent.env)
+                        owner_name.display(self.parent.env)
                     ),
                 );
                 return;
@@ -3554,10 +3579,19 @@ impl ModuleBuilder<'_, '_> {
         }
         et.finalize_types(true);
         let param_sym = self.symbol_pool().make(&fun_param.value);
-        // Find or create entry for this parameter
-        let entries = self.fun_param_access_of.entry(fun_name.symbol).or_default();
+        // Find or create entry for this parameter/field
+        let entries = if is_struct {
+            self.struct_field_access_of
+                .entry(owner_name.symbol)
+                .or_default()
+        } else {
+            self.fun_param_access_of
+                .entry(owner_name.symbol)
+                .or_default()
+        };
         if let Some(entry) = entries.iter_mut().find(|e| e.fun_param == param_sym) {
             entry.frame_spec.reads_targets = reads_types;
+            entry.frame_spec.reads_all = all;
         } else {
             entries.push(FunParamAccessOf {
                 loc: loc.clone(),
@@ -3566,11 +3600,47 @@ impl ModuleBuilder<'_, '_> {
                 frame_spec: FrameSpec {
                     modifies_targets: vec![],
                     reads_targets: reads_types,
+                    reads_all: all,
+                    ..Default::default()
                 },
                 used_memory: BTreeSet::new(),
                 old_memory: BTreeSet::new(),
             });
         }
+    }
+
+    /// Validate that `field_sym` names a function-typed field in the struct `struct_name`.
+    fn validate_struct_fun_field(
+        &self,
+        loc: &Loc,
+        struct_name: &QualifiedSymbol,
+        field_sym: Symbol,
+    ) -> bool {
+        if let Some(entry) = self.parent.struct_table.get(struct_name) {
+            let found = match &entry.layout {
+                StructLayout::Singleton(fields, _) => fields
+                    .values()
+                    .any(|f| f.name == field_sym && f.ty.is_function()),
+                StructLayout::Variants(variants) => variants.iter().any(|v| {
+                    v.fields
+                        .values()
+                        .any(|f| f.name == field_sym && f.ty.is_function())
+                }),
+                StructLayout::None => false,
+            };
+            if !found {
+                self.parent.env.error(
+                    loc,
+                    &format!(
+                        "`{}` is not a function-typed field of `{}`",
+                        field_sym.display(self.symbol_pool()),
+                        struct_name.display(self.parent.env)
+                    ),
+                );
+                return false;
+            }
+        }
+        true
     }
 
     fn def_ana_modifies(&mut self, loc: &Loc, context: &SpecBlockContext, targets: &[EA::Exp]) {
@@ -4675,6 +4745,11 @@ impl ModuleBuilder<'_, '_> {
                 },
                 StructLayout::None => false,
             };
+            // Collect field access declarations for this struct
+            let field_access_of = self
+                .struct_field_access_of
+                .remove(&name.symbol)
+                .unwrap_or_default();
             let data = StructData {
                 name: name.symbol,
                 loc: entry.loc.clone(),
@@ -4686,6 +4761,7 @@ impl ModuleBuilder<'_, '_> {
                 field_data,
                 variants: if is_enum { Some(variants) } else { None },
                 spec: RefCell::new(spec),
+                field_access_of,
                 is_native: entry.is_native,
                 visibility: entry.visibility,
                 has_package_visibility: self.package_structs.contains(&entry.struct_id),
